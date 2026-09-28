@@ -34,6 +34,9 @@ def parse_args():
                         help="Path to official VoxCeleb1-O veri_test.txt trial pairs")
     parser.add_argument("--cache-file", type=str, default=None,
                         help="Optional pre-computed teacher embedding cache")
+    parser.add_argument("--teacher-checkpoint", type=str,
+                        default="/home/oem/wiseyak_backup/wiseai-training-pipeline/packages/trainer-mect-sv/scratch/research-antspeaker/checkpoints/mect_b2_vb2.pt",
+                        help="Path to pretrained SOTA teacher checkpoint for metric distillation")
     # Hyperparameters
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size (128 for high VRAM saturation)")
@@ -49,7 +52,7 @@ def parse_args():
 def main():
     args = parse_args()
     print("=" * 75)
-    print("🎯 VoiceID-Net Production Training Engine (RTX 4090 Accelerated)")
+    print("VoiceID-Net Production Training Engine (RTX 4090 Accelerated)")
     print("=" * 75)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -108,8 +111,9 @@ def main():
         )
         print(f"[Evaluator] Indexed {len(evaluator.trials)} verification trial pairs.")
 
-    # 3. Trainer
+    # 3. Trainer (Student Backbone + SOTA Teacher Distillation)
     trainer = VoiceIDTrainer(
+        teacher_checkpoint=args.teacher_checkpoint,
         num_classes=num_classes,
         embed_dim=192,
         base_channels=64,
@@ -125,72 +129,23 @@ def main():
     global_step = 0
 
     print("=" * 75)
-    print(f"🚀 Training Launched! Batch Size: {args.batch_size} (Optimized VRAM Saturation)")
+    print(f"Training Launched! Batch Size: {args.batch_size} (Optimized VRAM Saturation)")
     print("=" * 75)
 
     for epoch in range(1, args.epochs + 1):
-        trainer.model.train()
-        if trainer.classifier is not None:
-            trainer.classifier.train()
-
-        total_loss = 0.0
-        total_acc = 0.0
-        pbar = tqdm(loader, desc=f"Epoch [{epoch:02d}/{args.epochs:02d}]", dynamic_ncols=True)
-
-        for batch_idx, batch in enumerate(pbar):
-            wavs = batch["wavs"].to(trainer.device)
-            labels = batch.get("labels", None)
-            if labels is not None:
-                labels = labels.to(trainer.device)
-            target_embs = batch.get("target_embs", None)
-            if target_embs is not None:
-                target_embs = target_embs.to(trainer.device)
-
-            with torch.no_grad():
-                fbanks = trainer.feature_extractor(wavs)
-            aug_fbanks = trainer.spec_aug(fbanks)
-
-            trainer.optimizer.zero_grad()
-            with torch.amp.autocast('cuda', enabled=trainer.use_amp):
-                model_embs = trainer.model(aug_fbanks)
-                loss = torch.tensor(0.0, device=trainer.device)
-                acc = 0.0
-
-                if trainer.classifier is not None and labels is not None:
-                    logits = trainer.classifier(model_embs, labels)
-                    loss = loss + torch.nn.functional.cross_entropy(logits, labels)
-                    acc = (logits.argmax(dim=-1) == labels).float().mean().item()
-
-                if target_embs is not None:
-                    dist_loss, _ = trainer.distill_loss_fn(model_embs, target_embs)
-                    loss = loss + dist_loss
-
-            trainer.scaler.scale(loss).backward()
-            trainer.scaler.unscale_(trainer.optimizer)
-            torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), max_norm=3.0)
-            trainer.scaler.step(trainer.optimizer)
-            trainer.scaler.update()
-
-            total_loss += loss.item()
-            total_acc += acc
-            global_step += 1
-
-            # Log to TensorBoard in real-time every 10 steps
-            if global_step % 10 == 0:
-                writer.add_scalar("Loss/train_step", loss.item(), global_step)
-                writer.add_scalar("Accuracy/train_step", acc * 100, global_step)
-
-            postfix = {"loss": f"{loss.item():.4f}"}
-            if trainer.classifier is not None:
-                postfix["acc"] = f"{acc * 100:.1f}%"
-            pbar.set_postfix(postfix)
-
-        n = max(1, len(loader))
-        epoch_loss = total_loss / n
-        epoch_acc = total_acc / n
+        metrics = trainer.train_epoch(
+            dataloader=loader,
+            epoch=epoch,
+            total_epochs=args.epochs,
+            writer=writer,
+            global_step=global_step
+        )
+        global_step = metrics["global_step"]
+        epoch_loss = metrics["total_loss"]
+        mean_sim = metrics.get("mean_cosine_similarity", 0.0)
 
         writer.add_scalar("Loss/epoch", epoch_loss, epoch)
-        writer.add_scalar("Accuracy/epoch", epoch_acc * 100, epoch)
+        writer.add_scalar("Distill/epoch_mean_sim", mean_sim, epoch)
 
         # Official Benchmark Evaluation on Vox1-O
         eer_str = "N/A"
@@ -206,9 +161,9 @@ def main():
                 best_eer = curr_eer
                 best_path = os.path.join(args.save_dir, "voiceid_best_eer.pt")
                 trainer.save_checkpoint(best_path)
-                print(f"⭐ New Best Vox1-O EER: {curr_eer:.2f}%! Saved to: {best_path}")
+                print(f"[Benchmark] New Best Vox1-O EER: {curr_eer:.2f}%! Saved to: {best_path}")
 
-        print(f"📊 [Epoch {epoch:02d}/{args.epochs:02d}] Loss: {epoch_loss:.4f} | Acc: {epoch_acc*100:.1f}% | Vox1-O EER: {eer_str}")
+        print(f"[Epoch {epoch:02d}/{args.epochs:02d}] Loss: {epoch_loss:.4f} | Sim to Teacher: {mean_sim:.3f} | Vox1-O EER: {eer_str}")
 
         latest_path = os.path.join(args.save_dir, "voiceid_latest.pt")
         trainer.save_checkpoint(latest_path)
@@ -219,8 +174,8 @@ def main():
 
     writer.close()
     print("=" * 75)
-    print(f"🎉 Training Complete! Best Loss: {best_loss:.4f} | Best Vox1-O EER: {best_eer:.2f}%")
-    print(f"💾 Checkpoints stored in: {args.save_dir}/")
+    print(f"[Training Complete] Best Loss: {best_loss:.4f} | Best Vox1-O EER: {best_eer:.2f}%")
+    print(f"[Storage] Checkpoints stored in: {args.save_dir}/")
     print("=" * 75)
 
     if args.export_onnx:
