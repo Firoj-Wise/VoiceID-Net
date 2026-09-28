@@ -1,0 +1,9 @@
+torch>=2.6.0
+torchaudio>=2.6.0
+soundfile>=0.14.0
+scipy>=1.15.0
+scikit-learn>=1.7.0
+tqdm>=4.66.0
+onnx>=1.23.0
+onnxruntime>=1.23.0
+matplotlib>=3.8.0

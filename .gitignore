@@ -1,0 +1,35 @@
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Training checkpoints & model weights
+checkpoints/
+weights/
+*.pt
+*.pth
+*.onnx
+
+# TensorBoard runs & logs
+runs/
+*.log
+
+# Datasets & downloads
+voxceleb_data/
+downloads/
+videos/
+data/*.wav
+data/*.pt
+!data/.gitkeep
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
