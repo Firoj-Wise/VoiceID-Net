@@ -39,7 +39,10 @@ def parse_args():
                         help="Path to pretrained SOTA teacher checkpoint for metric distillation")
     # Hyperparameters
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=128, help="Batch size (128 for high VRAM saturation)")
+    parser.add_argument("--batch-size", type=int, default=64, help="Micro-batch size (64 for 3.2 GB VRAM safety buffer)")
+    parser.add_argument("--accum-steps", type=int, default=2, help="Gradient accumulation steps (effective batch size = 64 * 2 = 128)")
+    parser.add_argument("--checkpoint-interval", type=int, default=500, help="Save checkpoint every N batches")
+    parser.add_argument("--resume", action="store_true", default=True, help="Auto-resume from latest checkpoint if available")
     parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (AdamW)")
     parser.add_argument("--chunk-seconds", type=float, default=2.0, help="Chunk length in seconds")
@@ -51,8 +54,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    effective_bs = args.batch_size * args.accum_steps
     print("=" * 75)
-    print("VoiceID-Net Production Training Engine (RTX 4090 Accelerated)")
+    print(f"VoiceID-Net Production Training Engine (RTX 4090 Accelerated)")
+    print(f"Configuration: Batch={args.batch_size}, Accum={args.accum_steps} (Effective Batch={effective_bs})")
     print("=" * 75)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -122,23 +127,39 @@ def main():
         use_amp=True
     )
 
-    # 4. Training Loop
+    # 4. Training Loop & Auto-Resume
     os.makedirs(args.save_dir, exist_ok=True)
     best_eer = float("inf")
     best_loss = float("inf")
     global_step = 0
+    start_epoch = 1
+    start_batch = 0
+
+    latest_step_ckpt = os.path.join(args.save_dir, "voiceid_step_latest.pt")
+    if args.resume and os.path.exists(latest_step_ckpt):
+        ckpt_meta = trainer.load_checkpoint(latest_step_ckpt)
+        if ckpt_meta:
+            start_epoch = ckpt_meta.get("epoch", 1)
+            start_batch = ckpt_meta.get("batch_idx", 0)
+            global_step = ckpt_meta.get("global_step", 0)
+            print(f"[Resume] Successfully resumed from Epoch {start_epoch}, Batch {start_batch}, Global Step {global_step}!")
 
     print("=" * 75)
-    print(f"Training Launched! Batch Size: {args.batch_size} (Optimized VRAM Saturation)")
+    print(f"Training Active! Batch: {args.batch_size} (VRAM: ~3.2 GB with 4GB safety headroom)")
     print("=" * 75)
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
+        current_start_batch = start_batch if epoch == start_epoch else 0
         metrics = trainer.train_epoch(
             dataloader=loader,
             epoch=epoch,
             total_epochs=args.epochs,
             writer=writer,
-            global_step=global_step
+            global_step=global_step,
+            accum_steps=args.accum_steps,
+            checkpoint_interval=args.checkpoint_interval,
+            save_dir=args.save_dir,
+            start_batch_idx=current_start_batch
         )
         global_step = metrics["global_step"]
         epoch_loss = metrics["total_loss"]

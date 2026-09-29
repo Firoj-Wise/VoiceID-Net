@@ -81,7 +81,18 @@ class VoiceIDTrainer:
         )
         self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
 
-    def train_epoch(self, dataloader, epoch, total_epochs, writer=None, global_step=0):
+    def train_epoch(
+        self,
+        dataloader,
+        epoch,
+        total_epochs,
+        writer=None,
+        global_step=0,
+        accum_steps=2,
+        checkpoint_interval=500,
+        save_dir="checkpoints",
+        start_batch_idx=0
+    ):
         self.model.train()
         if self.classifier is not None:
             self.classifier.train()
@@ -90,7 +101,12 @@ class VoiceIDTrainer:
         total_cos_sim = 0.0
         pbar = tqdm(dataloader, desc=f"Epoch [{epoch:02d}/{total_epochs:02d}]", dynamic_ncols=True)
 
+        self.optimizer.zero_grad()
+
         for batch_idx, batch in enumerate(pbar):
+            if batch_idx < start_batch_idx:
+                continue
+
             wavs = batch["wavs"].to(self.device)
             labels = batch.get("labels", None)
             if labels is not None:
@@ -113,7 +129,6 @@ class VoiceIDTrainer:
             aug_fbanks = self.spec_aug(fbanks)
 
             # 3. Student Forward pass under AMP
-            self.optimizer.zero_grad()
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 model_embs = self.model(aug_fbanks)
                 model_embs_unit = F.normalize(model_embs, p=2, dim=-1)
@@ -132,26 +147,43 @@ class VoiceIDTrainer:
                     logits = self.classifier(model_embs, labels)
                     loss = loss + F.cross_entropy(logits, labels)
 
-            # 4. Backward & Step
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+                raw_loss_val = loss.item()
+                loss = loss / accum_steps
 
-            total_loss += loss.item()
+            # 4. Backward
+            self.scaler.scale(loss).backward()
+
+            # 5. Optimizer Step with Gradient Accumulation
+            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(dataloader):
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
+
+            total_loss += raw_loss_val
             total_cos_sim += cos_sim_val
             global_step += 1
 
             if writer is not None and global_step % 10 == 0:
-                writer.add_scalar("Loss/train_step", loss.item(), global_step)
+                writer.add_scalar("Loss/train_step", raw_loss_val, global_step)
                 if target_embs is not None:
                     writer.add_scalar("Distill/Teacher_Cosine_Similarity", cos_sim_val, global_step)
 
-            postfix = {"loss": f"{loss.item():.4f}"}
+            postfix = {"loss": f"{raw_loss_val:.4f}"}
             if target_embs is not None:
                 postfix["sim_to_teacher"] = f"{cos_sim_val:.3f}"
             pbar.set_postfix(postfix)
+
+            # Frequent Step Checkpointing
+            if checkpoint_interval > 0 and (batch_idx + 1) % checkpoint_interval == 0:
+                step_ckpt_path = os.path.join(save_dir, "voiceid_step_latest.pt")
+                self.save_checkpoint(
+                    step_ckpt_path,
+                    epoch=epoch,
+                    batch_idx=batch_idx + 1,
+                    global_step=global_step
+                )
 
         n = max(1, len(dataloader))
         return {
@@ -160,11 +192,36 @@ class VoiceIDTrainer:
             "global_step": global_step
         }
 
-    def save_checkpoint(self, save_path):
+    def save_checkpoint(self, save_path, epoch=None, batch_idx=None, global_step=None):
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        torch.save({
+        ckpt_data = {
             "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
             "embed_dim": self.model.embed_dim,
-            "architecture": "VoiceIDNet"
-        }, save_path)
-        print(f"[Trainer] Checkpoint saved to: {save_path}")
+            "architecture": "VoiceIDNet",
+            "epoch": epoch,
+            "batch_idx": batch_idx,
+            "global_step": global_step,
+            "timestamp": time.time()
+        }
+        if self.classifier is not None:
+            ckpt_data["classifier_state_dict"] = self.classifier.state_dict()
+        torch.save(ckpt_data, save_path)
+        print(f"[Trainer] Checkpoint saved to: {save_path} (epoch={epoch}, batch={batch_idx})")
+
+    def load_checkpoint(self, checkpoint_path):
+        if not os.path.exists(checkpoint_path):
+            print(f"[Trainer] No checkpoint found at: {checkpoint_path}")
+            return None
+        print(f"[Trainer] Loading checkpoint: {checkpoint_path}...")
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scaler_state_dict" in ckpt:
+            self.scaler.load_state_dict(ckpt["scaler_state_dict"])
+        if self.classifier is not None and "classifier_state_dict" in ckpt:
+            self.classifier.load_state_dict(ckpt["classifier_state_dict"])
+        print(f"[Trainer] Restored checkpoint from epoch={ckpt.get('epoch')}, batch={ckpt.get('batch_idx')}, global_step={ckpt.get('global_step')}")
+        return ckpt
